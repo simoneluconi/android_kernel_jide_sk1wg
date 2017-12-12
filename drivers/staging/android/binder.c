@@ -16,6 +16,7 @@
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#define SIZE_MAX       (~(size_t)0)
 
 #include <asm/cacheflush.h>
 #include <linux/fdtable.h>
@@ -1557,8 +1558,7 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 			struct binder_ref *ref;
 
 			fp = to_flat_binder_object(hdr);
-			ref = binder_get_ref(proc, fp->handle,
-					     hdr->type == BINDER_TYPE_HANDLE);
+			ref = binder_get_ref(proc, fp->handle);
 			if (ref == NULL) {
 				pr_err("transaction release %d bad handle %d\n",
 				 debug_id, fp->handle);
@@ -1658,8 +1658,6 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 				  (u64)node->cookie);
 		return -EINVAL;
 	}
-	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk))
-		return -EPERM;
 
 	ref = binder_get_ref_for_node(target_proc, node);
 	if (!ref)
@@ -1691,15 +1689,12 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 	struct binder_proc *proc = thread->proc;
 	struct binder_proc *target_proc = t->to_proc;
 
-	ref = binder_get_ref(proc, fp->handle,
-			     fp->hdr.type == BINDER_TYPE_HANDLE);
+	ref = binder_get_ref(proc, fp->handle);
 	if (!ref) {
 		binder_user_error("%d:%d got transaction with invalid handle, %d\n",
 				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
 	}
-	if (security_binder_transfer_binder(proc->tsk, target_proc->tsk))
-		return -EPERM;
 
 	if (ref->node->proc == target_proc) {
 		if (fp->hdr.type == BINDER_TYPE_HANDLE)
@@ -1768,11 +1763,6 @@ static int binder_translate_fd(int fd,
 		ret = -EBADF;
 		goto err_fget;
 	}
-	ret = security_binder_transfer_file(proc->tsk, target_proc->tsk, file);
-	if (ret < 0) {
-		ret = -EPERM;
-		goto err_security;
-	}
 
 	target_fd = task_get_unused_fd_flags(target_proc, O_CLOEXEC);
 	if (target_fd < 0) {
@@ -1787,7 +1777,6 @@ static int binder_translate_fd(int fd,
 	return target_fd;
 
 err_get_unused_fd:
-err_security:
 	fput(file);
 err_fget:
 err_fd_not_accepted:
