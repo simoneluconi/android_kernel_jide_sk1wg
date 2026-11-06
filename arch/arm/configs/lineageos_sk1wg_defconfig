@@ -63,7 +63,7 @@ CONFIG_ARM_FLUSH_CONSOLE_ON_RESTART=y
 CONFIG_USE_OF=y
 CONFIG_ZBOOT_ROM_TEXT=0x0
 CONFIG_ZBOOT_ROM_BSS=0x0
-CONFIG_CMDLINE="androidboot.hardware=macallan androidboot.selinux=permissive"
+CONFIG_CMDLINE="androidboot.hardware=macallan androidboot.boot_devices=sdhci-tegra.3 androidboot.selinux=permissive"
 CONFIG_CMDLINE_EXTEND=y
 CONFIG_CPU_FREQ=y
 CONFIG_CPU_FREQ_DEFAULT_GOV_USERSPACE=y
@@ -247,8 +247,8 @@ CONFIG_USB_NET_RAW_IP=m
 CONFIG_WIFI_CONTROL_FUNC=y
 CONFIG_BCMDHD=y
 CONFIG_BCM43341=y
-CONFIG_BCMDHD_FW_PATH="/system/vendor/firmware/bcm43341/fw_bcmdhd.bin"
-CONFIG_BCMDHD_NVRAM_PATH="/system/etc/nvram.txt"
+CONFIG_BCMDHD_FW_PATH="/vendor/firmware/bcm43341/fw_bcmdhd.bin"
+CONFIG_BCMDHD_NVRAM_PATH="/vendor/etc/wifi/nvram_43341_rev4.txt"
 CONFIG_BCMDHD_HW_OOB=y
 CONFIG_BCMDHD_INSMOD_NO_FW_LOAD=y
 CONFIG_BCMDHD_EDP_SUPPORT=y
