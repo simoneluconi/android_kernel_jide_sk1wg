@@ -66,6 +66,7 @@
 #include <linux/atomic.h>
 #include <net/dst.h>
 #include <net/checksum.h>
+#include <net/tcp_states.h>
 
 struct cgroup;
 struct cgroup_subsys;
@@ -2151,6 +2152,16 @@ static inline struct sock *skb_steal_sock(struct sk_buff *skb)
 		return sk;
 	}
 	return NULL;
+}
+
+/*
+ * A full struct sock, not a smaller inet_timewait_sock posing as one (3.4
+ * has no request socks in the hash, so TIME_WAIT is the only case): only
+ * full socks have sk_uid and the other struct sock fields.
+ */
+static inline bool sk_fullsock(const struct sock *sk)
+{
+	return (1 << sk->sk_state) & ~(TCPF_TIME_WAIT);
 }
 
 extern void sock_enable_timestamp(struct sock *sk, int flag);
