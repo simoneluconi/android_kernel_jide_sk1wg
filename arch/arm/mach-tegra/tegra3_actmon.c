@@ -523,11 +523,20 @@ static struct actmon_dev actmon_dev_emc = {
 	/* EMC suspend floor to guarantee suspend entry on PLLM */
 	.suspend_freq		= EMC_PLLP_FREQ_MAX + 2000,
 
-	.boost_freq_step	= 16000,
-	.boost_up_coef		= 200,
-	.boost_down_coef	= 50,
-	.boost_up_threshold	= 60,
-	.boost_down_threshold	= 40,
+	/*
+	 * sk1wg: boost earlier, faster and longer. Android 14 composes the
+	 * whole 1080p screen on the GPU every frame; with NVIDIA's values
+	 * (step 16 MHz, coefs 200/50, thresholds 60/40) the EMC sat at
+	 * 102 MHz during a Settings fling, 32% of the frames were late and
+	 * the 90th percentile was 61 ms. These values give the same as an
+	 * EMC floor at 792 MHz (5-7% late, 23 ms) and still let it drop
+	 * when idle.
+	 */
+	.boost_freq_step	= 79200,	/* 10% of 792 MHz */
+	.boost_up_coef		= 800,
+	.boost_down_coef	= 90,
+	.boost_up_threshold	= 20,
+	.boost_down_threshold	= 10,
 
 	.up_wmark_window	= 1,
 	.down_wmark_window	= 3,
