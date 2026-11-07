@@ -46,7 +46,14 @@ static struct page_info *alloc_largest_available(unsigned long size)
 		if (!page)
 			continue;
 		split_page(page, orders[i]);
-		info = kmalloc(sizeof(struct page_info *), GFP_KERNEL);
+		info = kmalloc(sizeof(struct page_info), GFP_KERNEL);
+		if (!info) {
+			int j;
+
+			for (j = 0; j < (1 << orders[i]); j++)
+				__free_page(page + j);
+			return NULL;
+		}
 		info->page = page;
 		info->order = orders[i];
 		return info;
@@ -89,6 +96,8 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 		struct page *page = info->page;
 		for (i = 0; i < (1 << info->order); i++) {
 			sg_set_page(sg, page + i, PAGE_SIZE, 0);
+			/* needed by the dma_sync_sg_for_device() below */
+			sg_dma_address(sg) = sg_phys(sg);
 			sg = sg_next(sg);
 		}
 		list_del(&info->list);
@@ -104,7 +113,7 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 err1:
 	kfree(table);
 err:
-	list_for_each_entry(info, &pages, list) {
+	list_for_each_entry_safe(info, tmp_info, &pages, list) {
 		for (i = 0; i < (1 << info->order); i++)
 			__free_page(info->page + i);
 		kfree(info);
