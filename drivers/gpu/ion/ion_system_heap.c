@@ -72,7 +72,18 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 	struct list_head pages;
 	struct page_info *info, *tmp_info;
 	int i;
-	long size_remaining = PAGE_ALIGN(size);
+	unsigned long size_remaining = PAGE_ALIGN(size);
+
+	/*
+	 * As upstream "staging: ion: Fix overflow and list bugs in system
+	 * heap": a size above 2 GB went negative in the old signed counter
+	 * (an sg_table of NULL pages), and one that aligns to 0 made
+	 * sg_alloc_table(0) write before its array.
+	 */
+	if (!size_remaining)
+		return -EINVAL;
+	if (size_remaining / PAGE_SIZE > totalram_pages / 2)
+		return -ENOMEM;
 
 	INIT_LIST_HEAD(&pages);
 	while (size_remaining > 0) {

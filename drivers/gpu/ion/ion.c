@@ -396,10 +396,13 @@ struct ion_handle *ion_alloc(struct ion_client *client, size_t len,
 	 * request of the caller allocate from it.  Repeat until allocate has
 	 * succeeded or all heaps have been tried
 	 */
-	if (WARN_ON(!len))
+	if (!len)
 		return ERR_PTR(-EINVAL);
 
+	/* a len within a page of SIZE_MAX would align to 0 */
 	len = PAGE_ALIGN(len);
+	if (!len)
+		return ERR_PTR(-EINVAL);
 
 	mutex_lock(&dev->lock);
 	for (n = rb_first(&dev->heaps); n != NULL; n = rb_next(n)) {
@@ -441,22 +444,29 @@ struct ion_handle *ion_alloc(struct ion_client *client, size_t len,
 }
 EXPORT_SYMBOL(ion_alloc);
 
+/*
+ * Validate and drop under client->lock, and only touch the handle once it is
+ * known to be valid (as upstream "staging/android/ion: fix a race condition
+ * in the ion driver", CVE-2016-9120): two threads freeing the same handle
+ * used to race to a use-after-free.
+ */
+static int ion_free_nolock(struct ion_client *client, struct ion_handle *handle)
+{
+	if (!ion_handle_validate(client, handle))
+		return -EINVAL;
+	BUG_ON(client != handle->client);
+	ion_handle_put(handle);
+	return 0;
+}
+
 void ion_free(struct ion_client *client, struct ion_handle *handle)
 {
-	bool valid_handle;
-
-	BUG_ON(client != handle->client);
+	int ret;
 
 	mutex_lock(&client->lock);
-	valid_handle = ion_handle_validate(client, handle);
-
-	if (!valid_handle) {
-		WARN(1, "%s: invalid handle passed to free.\n", __func__);
-		mutex_unlock(&client->lock);
-		return;
-	}
-	ion_handle_put(handle);
+	ret = ion_free_nolock(client, handle);
 	mutex_unlock(&client->lock);
+	WARN(ret, "%s: invalid handle passed to free.\n", __func__);
 }
 EXPORT_SYMBOL(ion_free);
 
@@ -797,29 +807,20 @@ static void ion_buffer_sync_for_device(struct ion_buffer *buffer,
 				       struct device *dev,
 				       enum dma_data_direction dir)
 {
-	struct scatterlist *sg;
-	int i;
-	struct ion_vma_list *vma_list;
-
 	pr_debug("%s: syncing for device %s\n", __func__,
 		 dev ? dev_name(dev) : "null");
 
 	if (!(buffer->flags & ION_FLAG_CACHED))
 		return;
 
+	/*
+	 * Cached buffers are mapped up front now (ion_mmap), so no page is
+	 * ever marked dirty from a fault and buffer->vmas stays empty: sync
+	 * the whole buffer, as later upstream ION does.
+	 */
 	mutex_lock(&buffer->lock);
-	for_each_sg(buffer->sg_table->sgl, sg, buffer->sg_table->nents, i) {
-		if (!test_bit(i, buffer->dirty))
-			continue;
-		dma_sync_sg_for_device(dev, sg, 1, dir);
-		clear_bit(i, buffer->dirty);
-	}
-	list_for_each_entry(vma_list, &buffer->vmas, list) {
-		struct vm_area_struct *vma = vma_list->vma;
-
-		zap_page_range(vma, vma->vm_start, vma->vm_end - vma->vm_start,
-			       NULL);
-	}
+	dma_sync_sg_for_device(dev, buffer->sg_table->sgl,
+			       buffer->sg_table->nents, dir);
 	mutex_unlock(&buffer->lock);
 }
 
@@ -893,6 +894,14 @@ static int ion_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		       "to userspace\n", __func__);
 		return -EINVAL;
 	}
+
+	/*
+	 * A private writable mapping is copy-on-write, where remap_pfn_range()
+	 * (map_user) fails and the caller would silently fault in zero pages
+	 * instead of the buffer.
+	 */
+	if (!(vma->vm_flags & VM_SHARED))
+		return -EINVAL;
 
 	/*
 	 * Cached buffers used to be mapped page by page from ion_vm_fault()
@@ -989,16 +998,19 @@ int ion_share_dma_buf(struct ion_client *client, struct ion_handle *handle)
 	bool valid_handle;
 	int fd;
 
+	/* take the buffer reference while the handle is known to be valid */
 	mutex_lock(&client->lock);
 	valid_handle = ion_handle_validate(client, handle);
+	if (valid_handle) {
+		buffer = handle->buffer;
+		ion_buffer_get(buffer);
+	}
 	mutex_unlock(&client->lock);
 	if (!valid_handle) {
-		WARN(1, "%s: invalid handle passed to share.\n", __func__);
+		pr_debug("%s: invalid handle passed to share.\n", __func__);
 		return -EINVAL;
 	}
 
-	buffer = handle->buffer;
-	ion_buffer_get(buffer);
 	dmabuf = dma_buf_export(buffer, &dma_buf_ops, buffer->size, O_RDWR);
 	if (IS_ERR(dmabuf)) {
 		ion_buffer_put(buffer);
@@ -1097,17 +1109,16 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case ION_IOC_FREE:
 	{
 		struct ion_handle_data data;
-		bool valid;
+		int ret;
 
 		if (copy_from_user(&data, (void __user *)arg,
 				   sizeof(struct ion_handle_data)))
 			return -EFAULT;
 		mutex_lock(&client->lock);
-		valid = ion_handle_validate(client, data.handle);
+		ret = ion_free_nolock(client, data.handle);
 		mutex_unlock(&client->lock);
-		if (!valid)
-			return -EINVAL;
-		ion_free(client, data.handle);
+		if (ret)
+			return ret;
 		break;
 	}
 	/*
