@@ -60,8 +60,12 @@ void gpio_keys_send_event(void)
 
 	if (drdate == NULL)
 		return;
+	/*
+	 * system_nrt_wq, here and below: system_wq can run the same work item
+	 * on two CPUs at once in 3.4, and a stale state could be reported last.
+	 */
 	for (i = 0; i < drdate->nbuttons; i++)
-		schedule_work(&drdate->data[i].work);
+		queue_work(system_nrt_wq, &drdate->data[i].work);
 }
 
 static void gpio_keys_report_event(struct work_struct *work)
@@ -76,7 +80,7 @@ static void gpio_keys_timer(unsigned long _data)
 {
     struct gpio_button_data *data = (struct gpio_button_data *)_data;
 
-    schedule_work(&data->work);
+    queue_work(system_nrt_wq, &data->work);
 }
 
 static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
@@ -90,7 +94,7 @@ static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
         mod_timer(&bdata->timer,
             jiffies + msecs_to_jiffies(button->debounce_interval));
     else
-        schedule_work(&bdata->work);
+        queue_work(system_nrt_wq, &bdata->work);
 
     return IRQ_HANDLED;
 }
@@ -129,7 +133,6 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
         __set_bit(EV_REP, input->evbit); 
 
     ddata->input = input;
-	drdate = ddata;
 
     for (i = 0; i < pdata->nbuttons; i++) {
         struct gpio_keys_button *button = &pdata->buttons[i];
@@ -197,6 +200,12 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 	/* the initial state, open or closed */
 	for (i = 0; i < pdata->nbuttons; i++)
 		gpio_keys_report_state(&ddata->data[i]);
+
+	/*
+	 * Publish for gpio_keys_send_event() only now: the eDP bridge can
+	 * call it at any time, and the work items must be initialised.
+	 */
+	drdate = ddata;
 
 	device_init_wakeup(&pdev->dev, wakeup);
 
