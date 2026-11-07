@@ -2084,6 +2084,22 @@ static void binder_transaction(struct binder_proc *proc,
 		}
 	}
 
+	/*
+	 * The sizes are binder_size_t (64 bits with the 64-bit binder ABI) but
+	 * binder_alloc_buf() takes size_t, 32 bits here: a buffers_size of
+	 * 2^32 - ALIGN(secctx_sz, 8) passed the 64-bit check above and was
+	 * truncated to no extra space, which put the security context inside
+	 * the data area (where the sender's data then overwrote it) or before
+	 * the buffer. Refuse sizes that do not fit.
+	 */
+	if (tr->data_size > SIZE_MAX || tr->offsets_size > SIZE_MAX ||
+	    extra_buffers_size > SIZE_MAX) {
+		binder_user_error("%d:%d got transaction with too large sizes\n",
+				  proc->pid, thread->pid);
+		return_error = BR_FAILED_REPLY;
+		goto err_bad_extra_size;
+	}
+
 	trace_binder_transaction(reply, t, target_node);
 
 	t->buffer = binder_alloc_buf(target_proc, tr->data_size,
