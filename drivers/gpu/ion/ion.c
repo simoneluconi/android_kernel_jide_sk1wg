@@ -894,17 +894,21 @@ static int ion_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
-	if (buffer->flags & ION_FLAG_CACHED) {
-		vma->vm_private_data = buffer;
-		vma->vm_ops = &ion_vma_ops;
-		ion_vm_open(vma);
-	} else {
+	/*
+	 * Cached buffers used to be mapped page by page from ion_vm_fault()
+	 * with vm_insert_page(). A dma-buf file wants write-notify, so those
+	 * pages came in read-only and the first CPU write took do_wp_page()'s
+	 * shared-dirty path on pageless anonymous pages: kernel BUG at
+	 * mm/memory.c. Map cached buffers up front like uncached ones, just
+	 * with a cacheable pgprot (VM_PFNMAP mappings get no write-notify).
+	 * Such vmas are not on buffer->vmas, so syncs never zap them.
+	 */
+	if (!(buffer->flags & ION_FLAG_CACHED))
 		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-		mutex_lock(&buffer->lock);
-		/* now map it to userspace */
-		ret = buffer->heap->ops->map_user(buffer->heap, buffer, vma);
-		mutex_unlock(&buffer->lock);
-	}
+	mutex_lock(&buffer->lock);
+	/* now map it to userspace */
+	ret = buffer->heap->ops->map_user(buffer->heap, buffer, vma);
+	mutex_unlock(&buffer->lock);
 
 	if (ret)
 		pr_err("%s: failure mapping buffer to userspace\n",
