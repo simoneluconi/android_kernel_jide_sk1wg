@@ -16,3 +16,12 @@ config ION_TEGRA
 	help
 	  Choose this option if you wish to use ion on an nVidia Tegra.
 
+config ION_SYSTEM_ONLY
+	bool "Ion device with only a system heap"
+	depends on ION && !ION_TEGRA
+	help
+	  Register /dev/ion with a single vmalloc-backed system heap, for
+	  boards whose graphics use nvmap and which register no ION
+	  platform device. Android's Codec2 needs ION (or DMA-BUF heaps)
+	  for its linear buffers.
+

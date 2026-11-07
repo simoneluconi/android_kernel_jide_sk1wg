@@ -264,7 +264,7 @@ static void ion_buffer_remove_from_handle(struct ion_buffer *buffer)
 	mutex_unlock(&buffer->dev->lock);
 }
 
-static struct ion_handle *ion_handle_create(struct ion_client *client,
+struct ion_handle *ion_handle_create(struct ion_client *client,
 				     struct ion_buffer *buffer)
 {
 	struct ion_handle *handle;
@@ -347,8 +347,13 @@ bool ion_handle_validate(struct ion_client *client, struct ion_handle *handle)
 		else
 			return true;
 	}
-	WARN(1, "invalid handle passed h=0x%x,comm=%d\n", handle,
-		current->group_leader->comm);
+	/*
+	 * libion probes for the legacy ABI with ION_IOC_FREE on a NULL
+	 * handle, once per process: no backtrace for that.
+	 */
+	if (handle)
+		pr_debug("invalid handle %p from %s\n", handle,
+			 current->group_leader->comm);
 	return false;
 }
 
@@ -591,7 +596,15 @@ int ion_remap_dma(struct ion_client *client,
 	buffer = handle->buffer;
 	mutex_lock(&buffer->lock);
 
-	ret = iommu_heap_remap_dma(buffer->heap, buffer, addr);
+#ifdef CONFIG_ION_IOMMU
+	{
+		struct scatterlist *sg =
+			iommu_heap_remap_dma(buffer->heap, buffer, addr);
+		ret = IS_ERR(sg) ? PTR_ERR(sg) : 0;
+	}
+#else
+	ret = -ENODEV;
+#endif
 
 	mutex_unlock(&buffer->lock);
 	mutex_unlock(&client->lock);
@@ -1342,6 +1355,8 @@ void ion_device_destroy(struct ion_device *dev)
 	kfree(dev);
 }
 
+#ifdef CONFIG_ION_TEGRA
+/* Only tegra_ion uses this, and it relies on its own ion_client_get(). */
 struct ion_client *ion_client_get_file(int fd)
 {
 	struct ion_client *client = ERR_PTR(-EFAULT);
@@ -1357,6 +1372,7 @@ struct ion_client *ion_client_get_file(int fd)
 	fput(f);
 	return client;
 }
+#endif
 
 void __init ion_reserve(struct ion_platform_data *data)
 {
