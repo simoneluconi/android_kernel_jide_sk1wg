@@ -26,42 +26,50 @@ struct gpio_button_data {
 };
 
 struct gpio_keys_drvdata {
-	bool send_sw_lid;
-	bool first_sw_lid;
     struct input_dev *input;
+    int nbuttons;
     struct gpio_button_data data[0];
 };
 struct gpio_keys_drvdata *drdate = NULL;
+
+/*
+ * Report the switch as the GPIO reads now, both ways. The original driver
+ * only reported "closed" and left "open" to gpio_keys_send_event() from the
+ * eDP bridge's power-on, so on an Android that does not resume the panel
+ * the lid stayed closed forever and later closes produced no event.
+ */
+static void gpio_keys_report_state(struct gpio_button_data *bdata)
+{
+    struct gpio_keys_button *button = bdata->button;
+    struct input_dev *input = bdata->input;
+    unsigned int type = button->type ?: EV_KEY;
+    int state = (gpio_get_value(button->gpio) ? 1 : 0) ^ button->active_low;
+
+    input_event(input, type, button->code, !!state);
+    input_sync(input);
+}
+
+/*
+ * Called by the sn65dsi86 eDP bridge when the panel powers up. PK6 is not
+ * a T114 wake pin, so an open lid is not seen during LP0: resync the state
+ * here (the input core drops it if nothing changed).
+ */
 void gpio_keys_send_event(void)
 {
+	int i;
+
 	if (drdate == NULL)
 		return;
-
-	if (drdate->first_sw_lid) {
-		drdate->first_sw_lid = false;
-		return;
-	}
-
-	if (drdate->send_sw_lid) {
-		input_event(drdate->input, EV_SW, SW_LID, 0);
-		input_sync(drdate->input);
-		drdate->send_sw_lid = false;
-	}
+	for (i = 0; i < drdate->nbuttons; i++)
+		schedule_work(&drdate->data[i].work);
 }
 
 static void gpio_keys_report_event(struct work_struct *work)
 {
     struct gpio_button_data *bdata =
         container_of(work, struct gpio_button_data, work);
-    struct gpio_keys_button *button = bdata->button;
-    struct input_dev *input = bdata->input;
-    unsigned int type = button->type ?: EV_KEY;
-    int state = (gpio_get_value(button->gpio) ? 1 : 0) ^ button->active_low;
-	if (state) {
-		input_event(input, type, button->code, !!state);
-		input_sync(input);
-		drdate->send_sw_lid = true;
-	}
+
+    gpio_keys_report_state(bdata);
 }
 
 static void gpio_keys_timer(unsigned long _data)
@@ -105,6 +113,7 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
     }
 
     platform_set_drvdata(pdev, ddata);
+    ddata->nbuttons = pdata->nbuttons;
 
     input->name = pdev->name;
     input->phys = "sw-key/input0";
@@ -185,16 +194,9 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
         goto fail2;
 	}
 
-	for (i = 0; i < pdata->nbuttons; i++) {
-		unsigned int type = pdata->buttons[i].type ?: EV_KEY;
-		int state = (gpio_get_value(pdata->buttons[i].gpio) ? 1 : 0) ^ pdata->buttons[i].active_low;
-		if (pdata->buttons[i].code == SW_LID && state) {
-			input_event(input, type, pdata->buttons[i].code, !!state);
-			input_sync(input);
-			drdate->send_sw_lid = true;
-			drdate->first_sw_lid = true;
-		}
-	}
+	/* the initial state, open or closed */
+	for (i = 0; i < pdata->nbuttons; i++)
+		gpio_keys_report_state(&ddata->data[i]);
 
 	device_init_wakeup(&pdev->dev, wakeup);
 
