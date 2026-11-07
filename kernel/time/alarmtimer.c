@@ -437,6 +437,47 @@ u64 alarm_forward(struct alarm *alarm, ktime_t now, ktime_t interval)
 	return overrun;
 }
 
+/*
+ * The helpers timerfd's alarm clocks use (upstream added them with the
+ * per-alarm hrtimer rework). Here every base has one hrtimer and a queue,
+ * so they sit on alarm_start(), which dequeues and requeues.
+ */
+
+/**
+ * alarm_start_relative - Sets a relative alarm to fire
+ * @alarm: ptr to alarm to set
+ * @start: time relative to now to run the alarm
+ */
+void alarm_start_relative(struct alarm *alarm, ktime_t start)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	alarm_start(alarm, ktime_add(start, base->gettime()));
+}
+
+/**
+ * alarm_restart - Requeue an alarm at its (forwarded) expiry time
+ * @alarm: ptr to alarm to requeue
+ */
+void alarm_restart(struct alarm *alarm)
+{
+	alarm_start(alarm, alarm->node.expires);
+}
+
+/**
+ * alarm_forward_now - Forward an alarm's expiry past the current time
+ * @alarm: ptr to alarm to forward
+ * @interval: the period
+ *
+ * Returns the number of overruns.
+ */
+u64 alarm_forward_now(struct alarm *alarm, ktime_t interval)
+{
+	struct alarm_base *base = &alarm_bases[alarm->type];
+
+	return alarm_forward(alarm, base->gettime(), interval);
+}
+
 
 
 
