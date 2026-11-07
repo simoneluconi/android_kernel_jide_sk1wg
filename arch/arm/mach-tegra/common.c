@@ -172,6 +172,34 @@ u32 tegra_uart_config[3] = {
 
 #define NEVER_RESET 0
 
+#ifdef CONFIG_TEGRA_PANIC_TO_BOOTLOADER
+/*
+ * Bring-up aid: panic() restarts with no command, which clears the boot
+ * mode and boots the flashed kernel. Restart into the bootloader instead,
+ * where fastboot answers at once and can RAM-boot a debug image that
+ * reads /proc/last_kmsg.
+ */
+static bool tegra_panic_in_progress;
+
+static int tegra_panic_to_bootloader(struct notifier_block *nb,
+				     unsigned long event, void *unused)
+{
+	tegra_panic_in_progress = true;
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block tegra_panic_nb = {
+	.notifier_call = tegra_panic_to_bootloader,
+};
+
+static int __init tegra_panic_to_bootloader_init(void)
+{
+	atomic_notifier_chain_register(&panic_notifier_list, &tegra_panic_nb);
+	return 0;
+}
+early_initcall(tegra_panic_to_bootloader_init);
+#endif
+
 void tegra_assert_system_reset(char mode, const char *cmd)
 {
 #if defined(CONFIG_TEGRA_FPGA_PLATFORM) || NEVER_RESET
@@ -181,6 +209,10 @@ void tegra_assert_system_reset(char mode, const char *cmd)
 	void __iomem *reset = IO_ADDRESS(TEGRA_PMC_BASE + 0);
 	u32 reg;
 
+#ifdef CONFIG_TEGRA_PANIC_TO_BOOTLOADER
+	if (!cmd && tegra_panic_in_progress)
+		cmd = "bootloader";
+#endif
 	reg = readl_relaxed(reset + PMC_SCRATCH0);
 	/* Writing recovery kernel or Bootloader mode in SCRATCH0 31:30:1 */
 	if (cmd) {

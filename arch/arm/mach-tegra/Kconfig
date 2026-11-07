@@ -161,6 +161,14 @@ config ARCH_TEGRA_HAS_SATA
 config ARCH_TEGRA_HAS_CL_DVFS
 	bool
 
+config TEGRA_PANIC_TO_BOOTLOADER
+	bool "Restart into the bootloader after a kernel panic"
+	help
+	  Bring-up aid: after a panic, restart with the bootloader boot
+	  mode set instead of booting the flashed kernel again, so that a
+	  debug image can be RAM-booted over fastboot to read the RAM
+	  console. Say N for normal use.
+
 config TEGRA_PCI
 	bool "PCIe host controller driver"
 	select PCI
