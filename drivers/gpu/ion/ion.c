@@ -1110,6 +1110,12 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ion_free(client, data.handle);
 		break;
 	}
+	/*
+	 * As in upstream ION: MAP hands out the same dma-buf fd as SHARE,
+	 * to be mmap()ed. libion's legacy ion_map() uses it, and Codec2's
+	 * C2AllocatorIon maps every buffer that way.
+	 */
+	case ION_IOC_MAP:
 	case ION_IOC_SHARE:
 	{
 		struct ion_fd_data data;
