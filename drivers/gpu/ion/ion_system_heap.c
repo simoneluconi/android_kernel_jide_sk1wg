@@ -96,8 +96,13 @@ static int ion_system_heap_allocate(struct ion_heap *heap,
 		struct page *page = info->page;
 		for (i = 0; i < (1 << info->order); i++) {
 			sg_set_page(sg, page + i, PAGE_SIZE, 0);
-			/* needed by the dma_sync_sg_for_device() below */
+			/*
+			 * Needed by the dma_sync_sg_for_device() below. With
+			 * CONFIG_NEED_SG_DMA_LENGTH, sg_dma_len() is a field of
+			 * its own that the rest of this heap and ion.c read.
+			 */
 			sg_dma_address(sg) = sg_phys(sg);
+			sg_dma_len(sg) = PAGE_SIZE;
 			sg = sg_next(sg);
 		}
 		list_del(&info->list);
@@ -127,8 +132,9 @@ void ion_system_heap_free(struct ion_buffer *buffer)
 	struct scatterlist *sg;
 	struct sg_table *table = buffer->priv_virt;
 
+	/* every entry is one page: the allocation split_page()d them */
 	for_each_sg(table->sgl, sg, table->nents, i)
-		__free_pages(sg_page(sg), get_order(sg_dma_len(sg)));
+		__free_page(sg_page(sg));
 	if (buffer->sg_table)
 		sg_free_table(buffer->sg_table);
 	kfree(buffer->sg_table);
