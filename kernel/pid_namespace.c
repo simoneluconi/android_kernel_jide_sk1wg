@@ -110,6 +110,7 @@ static struct pid_namespace *create_pid_namespace(struct pid_namespace *parent_p
 
 out_put_parent_pid_ns:
 	put_pid_ns(parent_pid_ns);
+	proc_free_inum(ns->proc_inum);
 out_free_map:
 	kfree(ns->pidmap[0].page);
 out_free:
