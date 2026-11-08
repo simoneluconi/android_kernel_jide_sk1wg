@@ -855,8 +855,14 @@ static ssize_t sock_splice_read(struct file *file, loff_t *ppos,
 {
 	struct socket *sock = file->private_data;
 
+	/*
+	 * AF_UNIX stream sockets only got a splice_read in 4.5. Android's
+	 * FileUtils.copy() splices from sockets (adb's streamed install
+	 * failed with "splice failed: EINVAL"): read them through the
+	 * socket's read path into the pipe instead.
+	 */
 	if (unlikely(!sock->ops->splice_read))
-		return -EINVAL;
+		return default_file_splice_read(file, ppos, pipe, len, flags);
 
 	sock_update_classid(sock->sk);
 
