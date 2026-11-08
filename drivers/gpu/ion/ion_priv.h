@@ -48,7 +48,7 @@ int ion_handle_put(struct ion_handle *handle);
 struct ion_handle *ion_handle_create(struct ion_client *client,
 				     struct ion_buffer *buffer);
 
-void ion_handle_add(struct ion_client *client, struct ion_handle *handle);
+int ion_handle_add(struct ion_client *client, struct ion_handle *handle);
 
 int ion_remap_dma(struct ion_client *client,
 		    struct ion_handle *handle,
