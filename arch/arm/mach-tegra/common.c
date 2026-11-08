@@ -178,8 +178,20 @@ u32 tegra_uart_config[3] = {
  * mode and boots the flashed kernel. Restart into the bootloader instead,
  * where fastboot answers at once and can RAM-boot a debug image that
  * reads /proc/last_kmsg.
+ *
+ * Off unless the command line has "tegra_panic_to_bootloader", so that one
+ * kernel serves both release builds (a panic reboots normally) and
+ * development builds (the device tree adds the option).
  */
 static bool tegra_panic_in_progress;
+static bool tegra_panic_to_bootloader_enabled;
+
+static int __init tegra_panic_to_bootloader_setup(char *unused)
+{
+	tegra_panic_to_bootloader_enabled = true;
+	return 1;
+}
+__setup("tegra_panic_to_bootloader", tegra_panic_to_bootloader_setup);
 
 static int tegra_panic_to_bootloader(struct notifier_block *nb,
 				     unsigned long event, void *unused)
@@ -194,7 +206,9 @@ static struct notifier_block tegra_panic_nb = {
 
 static int __init tegra_panic_to_bootloader_init(void)
 {
-	atomic_notifier_chain_register(&panic_notifier_list, &tegra_panic_nb);
+	if (tegra_panic_to_bootloader_enabled)
+		atomic_notifier_chain_register(&panic_notifier_list,
+					       &tegra_panic_nb);
 	return 0;
 }
 early_initcall(tegra_panic_to_bootloader_init);
