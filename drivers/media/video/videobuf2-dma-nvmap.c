@@ -17,6 +17,8 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/dma-mapping.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
 #include <linux/nvmap.h>
 
 #include <media/videobuf2-core.h>
@@ -142,13 +144,42 @@ static int vb2_dma_nvmap_mmap(void *buf_priv, struct vm_area_struct *vma)
 {
 	struct vb2_dc_buf *buf = buf_priv;
 
+	unsigned long size, off;
+	int ret;
+
 	if (!buf) {
 		printk(KERN_ERR "No buffer to map\n");
 		return -EINVAL;
 	}
 
-	return vb2_mmap_pfn_range(vma, buf->paddr, buf->size,
-				  &vb2_common_vm_ops, &buf->handler);
+	/*
+	 * sk1wg: buf->paddr is the device (SMMU) address of an IOVMM handle,
+	 * not a physical one: mapping it as a pfn made userspace read
+	 * nothing but MC decode errors. Map the handle's own pages, found
+	 * through its kernel mapping (nvmap_mmap() is vm_map_ram() there).
+	 */
+	if (!is_vmalloc_addr(buf->vaddr))
+		return -EINVAL;
+
+	size = min_t(unsigned long, vma->vm_end - vma->vm_start,
+		     PAGE_ALIGN(buf->size));
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+	for (off = 0; off < size; off += PAGE_SIZE) {
+		ret = remap_pfn_range(vma, vma->vm_start + off,
+				      vmalloc_to_pfn(buf->vaddr + off),
+				      PAGE_SIZE, vma->vm_page_prot);
+		if (ret) {
+			printk(KERN_ERR "Remapping memory failed, error: %d\n",
+			       ret);
+			return ret;
+		}
+	}
+
+	vma->vm_flags		|= VM_DONTEXPAND | VM_RESERVED;
+	vma->vm_private_data	= &buf->handler;
+	vma->vm_ops		= &vb2_common_vm_ops;
+	vma->vm_ops->open(vma);
+	return 0;
 }
 
 static void *vb2_dma_nvmap_get_userptr(void *alloc_ctx, unsigned long vaddr,

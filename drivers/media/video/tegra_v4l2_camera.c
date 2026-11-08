@@ -296,6 +296,11 @@ struct tegra_camera_dev {
 	struct clk			*clk_csi;
 	struct clk			*clk_isp;
 	struct clk			*clk_csus;
+	/*
+	 * sk1wg: what NVIDIA's 3.10 tegra_camera adds for Tegra 11x: the CSI
+	 * PHY (CIL) clocks, and system/memory clock floors for the VI.
+	 */
+	struct clk			*clk_extra[5];
 	struct regulator		*reg_csi;	/* avdd_dsi_csi */
 
 	void __iomem			*vi_base;
@@ -957,8 +962,22 @@ static void tegra_camera_work(struct work_struct *work)
 	mutex_unlock(&pcdev->work_mutex);
 }
 
+/* name and rate (0: leave it) for clk_extra[], from NVIDIA's 3.10 vi.c */
+static const struct {
+	const char	*name;
+	unsigned long	rate;
+} tegra_camera_extra_clks[] = {
+	{ "cilab",	102000000 },
+	{ "cilcd",	0 },
+	{ "cile",	0 },
+	{ "sclk",	80000000 },
+	{ "emc",	375000000 },
+};
+
 static void tegra_camera_activate(struct tegra_camera_dev *pcdev)
 {
+	int i;
+
 	/*
 	 * sk1wg: power the VI first, as NVIDIA's tegra_camera_power_on()
 	 * does: the CSI pads' supply, then the VE partition the VI lives in
@@ -982,6 +1001,9 @@ static void tegra_camera_activate(struct tegra_camera_dev *pcdev)
 	clk_prepare_enable(pcdev->clk_csi);
 	clk_prepare_enable(pcdev->clk_isp);
 	clk_prepare_enable(pcdev->clk_csus);
+	for (i = 0; i < ARRAY_SIZE(pcdev->clk_extra); i++)
+		if (pcdev->clk_extra[i])
+			clk_prepare_enable(pcdev->clk_extra[i]);
 
 	/* Save current syncpt values. */
 	tegra_camera_save_syncpts(pcdev);
@@ -989,6 +1011,8 @@ static void tegra_camera_activate(struct tegra_camera_dev *pcdev)
 
 static void tegra_camera_deactivate(struct tegra_camera_dev *pcdev)
 {
+	int i;
+
 	mutex_lock(&pcdev->work_mutex);
 
 	/* Cancel active buffer. */
@@ -1001,6 +1025,9 @@ static void tegra_camera_deactivate(struct tegra_camera_dev *pcdev)
 	mutex_unlock(&pcdev->work_mutex);
 
 	/* Turn off relevant clocks. */
+	for (i = 0; i < ARRAY_SIZE(pcdev->clk_extra); i++)
+		if (pcdev->clk_extra[i])
+			clk_disable_unprepare(pcdev->clk_extra[i]);
 	clk_disable_unprepare(pcdev->clk_vi);
 	clk_disable_unprepare(pcdev->clk_vi_sensor);
 	clk_disable_unprepare(pcdev->clk_csi);
@@ -1596,7 +1623,7 @@ static int __devinit tegra_camera_probe(struct platform_device *pdev)
 	struct tegra_camera_dev *pcdev;
 	struct nvhost_device_data *vi_data;
 	struct device *vi_dev;
-	int err = 0;
+	int err = 0, i;
 
 	/* the nvhost VI client has mapped the registers and owns the syncpts */
 	vi_dev = bus_find_device(&platform_bus_type, NULL, NULL,
@@ -1664,6 +1691,19 @@ static int __devinit tegra_camera_probe(struct platform_device *pdev)
 	clk_set_rate(pcdev->clk_vi, 150000000);
 	clk_set_rate(pcdev->clk_vi_sensor, 24000000);
 
+	for (i = 0; i < ARRAY_SIZE(pcdev->clk_extra); i++) {
+		struct clk *c = clk_get_sys("vi", tegra_camera_extra_clks[i].name);
+
+		if (IS_ERR_OR_NULL(c)) {
+			dev_info(&pdev->dev, "no %s clock\n",
+				 tegra_camera_extra_clks[i].name);
+			continue;
+		}
+		if (tegra_camera_extra_clks[i].rate)
+			clk_set_rate(c, tegra_camera_extra_clks[i].rate);
+		pcdev->clk_extra[i] = c;
+	}
+
 	pcdev->vi_base = vi_data->aperture;
 
 	pcdev->reg_csi = regulator_get(vi_dev, "avdd_dsi_csi");
@@ -1694,6 +1734,9 @@ exit_put_resources:
 	pm_runtime_disable(&pdev->dev);
 	if (pcdev->reg_csi)
 		regulator_put(pcdev->reg_csi);
+	for (i = 0; i < ARRAY_SIZE(pcdev->clk_extra); i++)
+		if (pcdev->clk_extra[i])
+			clk_put(pcdev->clk_extra[i]);
 	clk_put(pcdev->clk_csus);
 exit_put_clk_isp:
 	clk_put(pcdev->clk_isp);
@@ -1714,6 +1757,7 @@ static int __devexit tegra_camera_remove(struct platform_device *pdev)
 	struct soc_camera_host *ici = to_soc_camera_host(&pdev->dev);
 	struct tegra_camera_dev *pcdev = container_of(ici,
 					struct tegra_camera_dev, ici);
+	unsigned int i;
 
 	soc_camera_host_unregister(ici);
 
@@ -1723,6 +1767,9 @@ static int __devexit tegra_camera_remove(struct platform_device *pdev)
 
 	if (pcdev->reg_csi)
 		regulator_put(pcdev->reg_csi);
+	for (i = 0; i < ARRAY_SIZE(pcdev->clk_extra); i++)
+		if (pcdev->clk_extra[i])
+			clk_put(pcdev->clk_extra[i]);
 	clk_put(pcdev->clk_csus);
 	clk_put(pcdev->clk_isp);
 	clk_put(pcdev->clk_csi);
