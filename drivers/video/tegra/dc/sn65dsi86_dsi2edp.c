@@ -407,9 +407,39 @@ static void sn65dsi86_dsi2edp_enable(struct tegra_dc_dsi_data *dsi)
 		goto fail;
 	}
 
-	sn65dsi86_reg_read(dsi2edp,0x96,&val);//Verify PLL is locked
-	if (val != 0x01)
-		printk("link training write error !!!!");
+	/*
+	 * 0x96 (ML_TX_MODE) goes from 0x0a (semi-auto link training) to 0x01
+	 * (normal) once training is done, which can take longer than the
+	 * init3 writes: wait up to ~100 ms, and if it still has not trained,
+	 * clear the IRQ status and start training again, as edp_irq_work()
+	 * does. It used to read 0x96 once and only log.
+	 */
+	{
+		int tries, i;
+		unsigned int st;
+
+		for (tries = 0; tries < 3; tries++) {
+			for (i = 0; i < 20; i++) {
+				sn65dsi86_reg_read(dsi2edp, 0x96, &val);
+				if (val == 0x01)
+					break;
+				usleep_range(5000, 6000);
+			}
+			if (val == 0x01)
+				break;
+			sn65dsi86_reg_read(dsi2edp, 0xf8, &st);
+			sn65dsi86_reg_write(dsi2edp, 0xf8, st);
+			sn65dsi86_reg_write(dsi2edp, 0x96, 0x0a);
+		}
+		if (val != 0x01)
+			dev_err(&dsi->dc->ndev->dev,
+				"dsi2edp: link training failed, ML_TX_MODE %#x\n",
+				val);
+		else if (tries)
+			dev_info(&dsi->dc->ndev->dev,
+				 "dsi2edp: link trained after %d retries\n",
+				 tries);
+	}
 	dsi2edp->dsi2edp_enabled = true;
 	if(DEBUG)
 	bridge_read_table(dsi2edp,mode_common);
