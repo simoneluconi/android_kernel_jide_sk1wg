@@ -343,6 +343,26 @@ struct inodes_stat_t {
 #define FS_IOC32_SETVERSION		_IOW('v', 2, int)
 
 /*
+ * FS_IOC_FSGETXATTR / FS_IOC_FSSETXATTR (generic in upstream 4.5, from
+ * XFS; same layout as fs/xfs/xfs_fs.h's struct fsxattr).
+ */
+#define HAVE_FSXATTR 1
+struct fsxattr {
+	__u32		fsx_xflags;	/* xflags field value (get/set) */
+	__u32		fsx_extsize;	/* extsize field value (get/set)*/
+	__u32		fsx_nextents;	/* nextents field value (get)	*/
+	__u32		fsx_projid;	/* project identifier (get/set) */
+	unsigned char	fsx_pad[12];
+};
+#define FS_XFLAG_IMMUTABLE		0x00000008
+#define FS_XFLAG_APPEND			0x00000010
+#define FS_XFLAG_SYNC			0x00000020
+#define FS_XFLAG_NOATIME		0x00000040
+#define FS_XFLAG_NODUMP			0x00000080
+#define FS_IOC_FSGETXATTR		_IOR('X', 31, struct fsxattr)
+#define FS_IOC_FSSETXATTR		_IOW('X', 32, struct fsxattr)
+
+/*
  * Inode flags (FS_IOC_GETFLAGS / FS_IOC_SETFLAGS)
  */
 #define	FS_SECRM_FL			0x00000001 /* Secure deletion */

@@ -20,6 +20,23 @@
 
 #define MAX_32_NUM ((((unsigned long long) 1) << 32) - 1)
 
+static __u32 ext4_iflags_to_xflags(unsigned int flags)
+{
+	__u32 xflags = 0;
+
+	if (flags & EXT4_SYNC_FL)
+		xflags |= FS_XFLAG_SYNC;
+	if (flags & EXT4_IMMUTABLE_FL)
+		xflags |= FS_XFLAG_IMMUTABLE;
+	if (flags & EXT4_APPEND_FL)
+		xflags |= FS_XFLAG_APPEND;
+	if (flags & EXT4_NODUMP_FL)
+		xflags |= FS_XFLAG_NODUMP;
+	if (flags & EXT4_NOATIME_FL)
+		xflags |= FS_XFLAG_NOATIME;
+	return xflags;
+}
+
 long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct inode *inode = filp->f_dentry->d_inode;
@@ -34,6 +51,44 @@ long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		ext4_get_inode_flags(ei);
 		flags = ei->i_flags & EXT4_FL_USER_VISIBLE;
 		return put_user(flags, (int __user *) arg);
+	case FS_IOC_FSGETXATTR: {
+		/*
+		 * Android 11+'s vold reads and sets a quota project id on every
+		 * app directory under Android/data and fails the directory when
+		 * these ioctls are missing (apps then get a null external files
+		 * dir). This kernel has no project quotas: report the flags and
+		 * project id 0.
+		 */
+		struct fsxattr fa;
+
+		memset(&fa, 0, sizeof(fa));
+		ext4_get_inode_flags(ei);
+		fa.fsx_xflags = ext4_iflags_to_xflags(ei->i_flags &
+						      EXT4_FL_USER_VISIBLE);
+		if (copy_to_user((struct fsxattr __user *)arg, &fa, sizeof(fa)))
+			return -EFAULT;
+		return 0;
+	}
+	case FS_IOC_FSSETXATTR: {
+		/*
+		 * Accept a project id and drop it (nowhere to keep it without
+		 * project quotas; Android falls back from quota-based storage
+		 * accounting when /data has no quota support). Changing flags
+		 * this way is not supported: FS_IOC_SETFLAGS does that.
+		 */
+		struct fsxattr fa;
+
+		if (copy_from_user(&fa, (struct fsxattr __user *)arg,
+				   sizeof(fa)))
+			return -EFAULT;
+		if (!inode_owner_or_capable(inode))
+			return -EPERM;
+		ext4_get_inode_flags(ei);
+		if (fa.fsx_xflags != ext4_iflags_to_xflags(ei->i_flags &
+							   EXT4_FL_USER_VISIBLE))
+			return -EOPNOTSUPP;
+		return 0;
+	}
 	case EXT4_IOC_SETFLAGS: {
 		handle_t *handle = NULL;
 		int err, migrate = 0;
