@@ -3375,6 +3375,60 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		binder_free_thread(proc, thread);
 		thread = NULL;
 		break;
+	case BINDER_GET_NODE_INFO_FOR_REF: {
+		/*
+		 * servicemanager asks this every few seconds for its lazy
+		 * services (upstream 4.20, b7e6a8961b). Same rules as upstream:
+		 * only the handle may be set, only the context manager asks.
+		 */
+		struct binder_node_info_for_ref info;
+		struct binder_ref *ref;
+
+		if (size != sizeof(info) ||
+		    copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		if (info.strong_count || info.weak_count || info.reserved1 ||
+		    info.reserved2 || info.reserved3) {
+			binder_user_error("%d BINDER_GET_NODE_INFO_FOR_REF: only handle may be non-zero.",
+					  proc->pid);
+			ret = -EINVAL;
+			goto err;
+		}
+		if (!context->binder_context_mgr_node ||
+		    context->binder_context_mgr_node->proc != proc) {
+			ret = -EPERM;
+			goto err;
+		}
+		ref = binder_get_ref(proc, info.handle);
+		if (!ref || !ref->node) {
+			ret = -EINVAL;
+			goto err;
+		}
+		info.strong_count = ref->node->local_strong_refs +
+				    ref->node->internal_strong_refs;
+		info.weak_count = ref->node->local_weak_refs;
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
+	case BINDER_ENABLE_ONEWAY_SPAM_DETECTION: {
+		/*
+		 * Accepted so that every process does not log a failed ioctl
+		 * at start-up; the detection itself (BR_ONEWAY_SPAM_SUSPECT,
+		 * upstream 5.13) is not implemented, so nothing is reported.
+		 */
+		__u32 enable;
+
+		if (copy_from_user(&enable, ubuf, sizeof(enable))) {
+			ret = -EFAULT;
+			goto err;
+		}
+		break;
+	}
 	case BINDER_VERSION:
 		if (size != sizeof(struct binder_version)) {
 			ret = -EINVAL;
