@@ -27,6 +27,12 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include "t8ev5.h"
+#ifdef CONFIG_SOC_CAMERA
+#include <media/v4l2-subdev.h>
+#include <media/v4l2-mediabus.h>
+#include <media/soc_camera.h>
+#include <media/t8ev5_soc.h>
+#endif
 #include <linux/module.h>
 #include <linux/hrtimer.h>
 #include <linux/platform_device.h>
@@ -117,6 +123,13 @@ struct sensor_info {
 	struct t8ev5_config config;
 	struct i2c_client *i2c_client;
 	struct yuv_t8ev5_sensor_platform_data *pdata;
+#ifdef CONFIG_SOC_CAMERA
+	/* sk1wg: the soc_camera path ("t8ev5-soc"), see t8ev5_soc_probe() */
+	struct v4l2_subdev subdev;
+	struct t8ev5_soc_camera_link *soc;
+	struct v4l2_mbus_framefmt soc_fmt;
+	bool soc_powered;
+#endif
 };
 
 
@@ -1593,12 +1606,231 @@ static struct attribute_group ets_attr_group =
     .attrs = ets_attributes,
 };
 
+#ifdef CONFIG_SOC_CAMERA
+/*
+ * sk1wg: a soc_camera / V4L2 subdev front end for the Tegra V4L2 host
+ * (drivers/media/video/tegra_v4l2_camera.c), used when the board
+ * registers the sensor as "t8ev5-soc" through soc_camera instead of the
+ * "t8ev5" misc device for NVIDIA's camera stack. It drives the sensor
+ * with this driver's own code: sensor_set_sensor_flag() powers it on and
+ * detects T8EV5 or MT9P111, sensor_set_mode() loads Jide's register
+ * tables for one of the four sizes. Output: YUV 4:2:2 over CSI-2.
+ */
+static const struct sensor_mode t8ev5_soc_sizes[] = {
+	{ 640, 480 }, { 960, 720 }, { 1280, 720 }, { 2592, 1944 },
+};
+
+static struct sensor_info *to_t8ev5_info(struct v4l2_subdev *sd)
+{
+	return container_of(sd, struct sensor_info, subdev);
+}
+
+/* the smallest size that holds the request, else the largest */
+static void t8ev5_soc_fit(struct v4l2_mbus_framefmt *mf)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8ev5_soc_sizes) - 1; i++)
+		if (t8ev5_soc_sizes[i].xres >= mf->width &&
+		    t8ev5_soc_sizes[i].yres >= mf->height)
+			break;
+	mf->width = t8ev5_soc_sizes[i].xres;
+	mf->height = t8ev5_soc_sizes[i].yres;
+	mf->code = V4L2_MBUS_FMT_UYVY8_2X8;
+	mf->colorspace = V4L2_COLORSPACE_JPEG;
+	mf->field = V4L2_FIELD_NONE;
+}
+
+static int t8ev5_soc_apply_mode(struct sensor_info *info)
+{
+	struct sensor_mode mode = {
+		.xres = info->soc_fmt.width,
+		.yres = info->soc_fmt.height,
+	};
+
+	return sensor_set_mode(info, &mode);
+}
+
+static int t8ev5_soc_try_fmt(struct v4l2_subdev *sd,
+			     struct v4l2_mbus_framefmt *mf)
+{
+	t8ev5_soc_fit(mf);
+	return 0;
+}
+
+/* the host has no s_stream: the sensor switches modes here */
+static int t8ev5_soc_s_fmt(struct v4l2_subdev *sd,
+			   struct v4l2_mbus_framefmt *mf)
+{
+	struct sensor_info *info = to_t8ev5_info(sd);
+
+	t8ev5_soc_fit(mf);
+	info->soc_fmt = *mf;
+	if (!info->soc_powered)
+		return 0;
+	return t8ev5_soc_apply_mode(info);
+}
+
+static int t8ev5_soc_g_fmt(struct v4l2_subdev *sd,
+			   struct v4l2_mbus_framefmt *mf)
+{
+	*mf = to_t8ev5_info(sd)->soc_fmt;
+	return 0;
+}
+
+static int t8ev5_soc_enum_fmt(struct v4l2_subdev *sd, unsigned int index,
+			      enum v4l2_mbus_pixelcode *code)
+{
+	if (index)
+		return -EINVAL;
+	*code = V4L2_MBUS_FMT_UYVY8_2X8;
+	return 0;
+}
+
+static int t8ev5_soc_enum_framesizes(struct v4l2_subdev *sd,
+				     struct v4l2_frmsizeenum *fsize)
+{
+	if (fsize->index >= ARRAY_SIZE(t8ev5_soc_sizes))
+		return -EINVAL;
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	fsize->discrete.width = t8ev5_soc_sizes[fsize->index].xres;
+	fsize->discrete.height = t8ev5_soc_sizes[fsize->index].yres;
+	return 0;
+}
+
+static int t8ev5_soc_g_mbus_config(struct v4l2_subdev *sd,
+				   struct v4l2_mbus_config *cfg)
+{
+	struct sensor_info *info = to_t8ev5_info(sd);
+
+	cfg->type = V4L2_MBUS_CSI2;
+	cfg->flags = V4L2_MBUS_CSI2_CHANNEL_0 |
+		     V4L2_MBUS_CSI2_CONTINUOUS_CLOCK;
+	switch (info->soc->lanes) {
+	case 4:
+		cfg->flags |= V4L2_MBUS_CSI2_4_LANE;
+		break;
+	case 2:
+		cfg->flags |= V4L2_MBUS_CSI2_2_LANE;
+		break;
+	default:
+		cfg->flags |= V4L2_MBUS_CSI2_1_LANE;
+		break;
+	}
+	return 0;
+}
+
+static int t8ev5_soc_s_power(struct v4l2_subdev *sd, int on)
+{
+	struct sensor_info *info = to_t8ev5_info(sd);
+	int ret = 0;
+
+	if (on && !info->soc_powered) {
+		/* powers the sensor on and detects which one it is */
+		ret = sensor_set_sensor_flag(info, info->soc->flag);
+		if (ret) {
+			dev_err(&info->i2c_client->dev,
+				"no sensor answers (flag 0x%02x)\n",
+				info->soc->flag);
+			return ret;
+		}
+		info->soc_powered = true;
+		dev_info(&info->i2c_client->dev, "%s camera: sensor type %d\n",
+			 (info->soc->flag & T8EV5_FRONT_ID) ? "front" : "back",
+			 info->sensor_type);
+		/* a format set while off still has to reach the sensor */
+		if (info->soc_fmt.width)
+			ret = t8ev5_soc_apply_mode(info);
+	} else if (!on && info->soc_powered) {
+		if (info->pdata && info->pdata->power_off)
+			info->pdata->power_off(info->cur_flag);
+		atomic_set(&info->power_on_loaded, 0);
+		atomic_set(&info->sensor_init_loaded, 0);
+		info->soc_powered = false;
+	}
+	return ret;
+}
+
+static struct v4l2_subdev_core_ops t8ev5_soc_core_ops = {
+	.s_power	= t8ev5_soc_s_power,
+};
+
+static struct v4l2_subdev_video_ops t8ev5_soc_video_ops = {
+	.s_mbus_fmt	= t8ev5_soc_s_fmt,
+	.g_mbus_fmt	= t8ev5_soc_g_fmt,
+	.try_mbus_fmt	= t8ev5_soc_try_fmt,
+	.enum_mbus_fmt	= t8ev5_soc_enum_fmt,
+	.enum_framesizes = t8ev5_soc_enum_framesizes,
+	.g_mbus_config	= t8ev5_soc_g_mbus_config,
+};
+
+static struct v4l2_subdev_ops t8ev5_soc_ops = {
+	.core	= &t8ev5_soc_core_ops,
+	.video	= &t8ev5_soc_video_ops,
+};
+
+static int t8ev5_soc_probe(struct i2c_client *client)
+{
+	struct soc_camera_link *icl = soc_camera_i2c_to_link(client);
+	struct sensor_info *info;
+
+	if (!icl) {
+		dev_err(&client->dev, "t8ev5-soc without soc_camera link\n");
+		return -EINVAL;
+	}
+	/* one sensor_info for the whole driver, as on the misc path */
+	if (mt9p111_sensor_info)
+		return -EBUSY;
+
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+
+	info->soc = to_t8ev5_soc_camera_link(icl);
+	info->pdata = info->soc->sensor;
+	info->i2c_client = client;
+	atomic_set(&info->power_on_loaded, 0);
+	atomic_set(&info->sensor_init_loaded, 0);
+	mutex_init(&info->als_get_sensor_value_mutex);
+	info->soc_fmt.width = 640;
+	info->soc_fmt.height = 480;
+	t8ev5_soc_fit(&info->soc_fmt);
+
+	/* sets the i2c clientdata to &info->subdev */
+	v4l2_i2c_subdev_init(&info->subdev, client, &t8ev5_soc_ops);
+	mt9p111_sensor_info = info;
+	dev_info(&client->dev, "t8ev5-soc: %s camera, %d CSI lane(s)\n",
+		 (info->soc->flag & T8EV5_FRONT_ID) ? "front" : "back",
+		 info->soc->lanes);
+	return 0;
+}
+
+static int t8ev5_soc_remove(struct i2c_client *client)
+{
+	struct sensor_info *info = to_t8ev5_info(i2c_get_clientdata(client));
+
+	t8ev5_soc_s_power(&info->subdev, 0);
+	if (info->soc->link.free_bus)
+		info->soc->link.free_bus(&info->soc->link);
+	mutex_destroy(&info->als_get_sensor_value_mutex);
+	if (mt9p111_sensor_info == info)
+		mt9p111_sensor_info = NULL;
+	kfree(info);
+	return 0;
+}
+#endif /* CONFIG_SOC_CAMERA */
+
 static int sensor_probe(struct i2c_client *client,
 			const struct i2c_device_id *id)
 {
 	int err;
 	struct platform_device * sensor_t8ev5_dev;
 	pr_info("t8ev5 %s\n",__func__);
+
+#ifdef CONFIG_SOC_CAMERA
+	if (id->driver_data)
+		return t8ev5_soc_probe(client);
+#endif
 
 	mt9p111_sensor_info = kzalloc(sizeof(struct sensor_info), GFP_KERNEL);
 	if (!mt9p111_sensor_info) {
@@ -1611,7 +1843,7 @@ static int sensor_probe(struct i2c_client *client,
 		pr_err("t8ev5 : Unable to register misc device!\n");
 		goto EXIT;
 	}
-	
+
 	mt9p111_sensor_info->pdata = client->dev.platform_data;
 	mt9p111_sensor_info->i2c_client = client;
 
@@ -1669,6 +1901,11 @@ static int sensor_remove(struct i2c_client *client)
 	struct sensor_info *info;
 
 	pr_info("t8ev5 %s\n",__func__);
+#ifdef CONFIG_SOC_CAMERA
+	if (soc_camera_i2c_to_link(client) &&
+	    !strcmp(client->name, "t8ev5-soc"))
+		return t8ev5_soc_remove(client);
+#endif
 	info = i2c_get_clientdata(client);
 	misc_deregister(&sensor_device);
 	mutex_destroy(&info->als_get_sensor_value_mutex);
@@ -1678,6 +1915,9 @@ static int sensor_remove(struct i2c_client *client)
 
 static const struct i2c_device_id sensor_id[] = {
 	{ SENSOR_NAME, 0 },
+#ifdef CONFIG_SOC_CAMERA
+	{ "t8ev5-soc", 1 },
+#endif
 	{ },
 };
 

@@ -21,9 +21,9 @@ obj-$(CONFIG_TEGRA_GRHOST) += t20/
 obj-$(CONFIG_TEGRA_GRHOST) += t30/
 obj-$(CONFIG_TEGRA_GRHOST) += gr2d/
 obj-$(CONFIG_TEGRA_GRHOST) += isp/
-ifneq ($(CONFIG_VIDEO_TEGRA),y)
+# sk1wg: always; the V4L2 host (VIDEO_TEGRA) is a separate device that
+# drives the VI through this nvhost client, not a replacement for it
 obj-$(CONFIG_TEGRA_GRHOST) += vi/
-endif
 obj-$(CONFIG_TEGRA_GRHOST) += t114/
 obj-$(CONFIG_TEGRA_GRHOST) += msenc/
 obj-$(CONFIG_TEGRA_GRHOST) += tsec/

@@ -60,6 +60,11 @@
 #ifdef CONFIG_VIDEO_T8EV5
 #include <media/t8ev5.h>
 #endif
+#ifdef CONFIG_VIDEO_TEGRA
+#include <media/soc_camera.h>
+#include <media/tegra_v4l2_camera.h>
+#include <media/t8ev5_soc.h>
+#endif
 
 #if defined(CONFIG_INPUT_KIONIX_ACCEL)
 #include <linux/input/kionix_accel.h>
@@ -492,7 +497,8 @@ static void camera_gpio_init(void)
 #endif
 }
 
-static struct i2c_board_info macallan_camera_i2c_board_info[] = {
+/* NVIDIA's camera stack ("t8ev5" misc device); unused with VIDEO_TEGRA */
+static struct i2c_board_info __maybe_unused macallan_camera_i2c_board_info[] = {
 #ifdef CONFIG_VIDEO_T8EV5
 	{
 		I2C_BOARD_INFO("t8ev5", 0x3c),
@@ -506,6 +512,54 @@ static struct i2c_board_info macallan_camera_i2c_board_info[] = {
 	},
 #endif
 };
+
+#if defined(CONFIG_VIDEO_TEGRA) && defined(CONFIG_VIDEO_T8EV5)
+/*
+ * sk1wg: the back camera on the Tegra V4L2 host (soc_camera,
+ * drivers/media/video/tegra_v4l2_camera.c) instead of NVIDIA's camera
+ * stack, which needs Android 5.1 libraries. The sensor driver is the same
+ * t8ev5.c, bound as "t8ev5-soc". The CSI port and lane count are not in
+ * the kernel (NVIDIA's userspace programmed the VI): CSI-A with 2 lanes
+ * is a first guess, and tegra_v4l2_camera's force_port and force_lanes
+ * parameters change them at run time. Front and back share address 0x3c,
+ * so only the back camera is registered for now.
+ */
+static struct tegra_camera_platform_data sk1wg_back_camera_pdata = {
+	.port		= TEGRA_CAMERA_PORT_CSI_A,
+	.lanes		= 2,
+	.continuous_clk	= false,
+};
+
+static struct i2c_board_info sk1wg_back_camera_i2c = {
+	I2C_BOARD_INFO("t8ev5-soc", 0x3c),
+};
+
+static struct t8ev5_soc_camera_link sk1wg_back_camera_link = {
+	.link = {
+		.bus_id		= 0,	/* the tegra-camera.0 host */
+		.i2c_adapter_id	= 2,
+		.board_info	= &sk1wg_back_camera_i2c,
+		.priv		= &sk1wg_back_camera_pdata,
+	},
+	.sensor	= &kai_t8ev5_data,
+	.flag	= 0,			/* back */
+	.lanes	= 2,
+};
+
+static struct platform_device sk1wg_back_camera = {
+	.name	= "soc-camera-pdrv",
+	.id	= 0,
+	.dev	= {
+		.platform_data = &sk1wg_back_camera_link.link,
+	},
+};
+
+static struct platform_device sk1wg_camera_host = {
+	.name	= "tegra-camera",
+	.id	= 0,
+};
+#endif
+
 static int macallan_camera_init(void)
 {
 	tegra_pinmux_config_table(&mclk_disable, 1);
@@ -515,8 +569,13 @@ static int macallan_camera_init(void)
 	kai_t8ev5_data.flash_delay = 0;
 	kai_t8ev5_data.flash_en= 0;
 	kai_t8ev5_data.led_en= 0;
+#if defined(CONFIG_VIDEO_TEGRA) && defined(CONFIG_VIDEO_T8EV5)
+	platform_device_register(&sk1wg_camera_host);
+	platform_device_register(&sk1wg_back_camera);
+#else
 	i2c_register_board_info(2, macallan_camera_i2c_board_info,
 		ARRAY_SIZE(macallan_camera_i2c_board_info));
+#endif
 
 	return 0;
 }

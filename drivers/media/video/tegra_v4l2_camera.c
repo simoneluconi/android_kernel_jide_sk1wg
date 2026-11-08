@@ -17,6 +17,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
+#include <linux/regulator/consumer.h>
+#include <mach/powergate.h>
 #include <linux/clk.h>
 #include <linux/pm_runtime.h>
 #include <linux/nvhost.h>
@@ -30,7 +33,18 @@
 #include "bus_client.h"
 #include "host1x/host1x_syncpt.h"
 
-#define TEGRA_CAM_DRV_NAME "vi"
+#define TEGRA_CAM_DRV_NAME "tegra-camera"
+
+/*
+ * sk1wg bring-up: override the attached sensor's CSI port (1 = CSI-A,
+ * 2 = CSI-B) and data lane count at run time, through
+ * /sys/module/tegra_v4l2_camera/parameters/, to find what the board
+ * wires up without a rebuild. 0 keeps the board's value.
+ */
+static int force_port;
+module_param(force_port, int, 0644);
+static int force_lanes;
+module_param(force_lanes, int, 0644);
 #define TEGRA_CAM_VERSION_CODE KERNEL_VERSION(0, 0, 5)
 
 #define TEGRA_SYNCPT_VI_WAIT_TIMEOUT                    200
@@ -266,7 +280,15 @@ struct tegra_buffer {
 struct tegra_camera_dev {
 	struct soc_camera_host		ici;
 	struct soc_camera_device	*icd;
-	struct nvhost_device		*ndev;
+	/*
+	 * sk1wg: this driver used to be the nvhost "vi" client itself (the
+	 * old nvhost_device bus). On this nvhost the "vi" platform device
+	 * belongs to drivers/video/tegra/host/vi, so the host is a separate
+	 * platform device that drives the VI through vi_pdev.
+	 */
+	struct platform_device		*pdev;
+	struct platform_device		*vi_pdev;
+	/* the attached sensor's (soc_camera_link.priv), set in add_device */
 	struct tegra_camera_platform_data *pdata;
 
 	struct clk			*clk_vi;
@@ -274,6 +296,7 @@ struct tegra_camera_dev {
 	struct clk			*clk_csi;
 	struct clk			*clk_isp;
 	struct clk			*clk_csus;
+	struct regulator		*reg_csi;	/* avdd_dsi_csi */
 
 	void __iomem			*vi_base;
 	spinlock_t			videobuf_queue_lock;
@@ -346,20 +369,20 @@ static struct tegra_buffer *to_tegra_vb(struct vb2_buffer *vb)
 static void tegra_camera_save_syncpts(struct tegra_camera_dev *pcdev)
 {
 	pcdev->syncpt_csi =
-		nvhost_syncpt_read_ext(pcdev->ndev,
+		nvhost_syncpt_read_ext(pcdev->vi_pdev,
 				       TEGRA_VI_SYNCPT_CSI);
 
 	pcdev->syncpt_vi =
-		nvhost_syncpt_read_ext(pcdev->ndev,
+		nvhost_syncpt_read_ext(pcdev->vi_pdev,
 				       TEGRA_VI_SYNCPT_VI);
 }
 
 static void tegra_camera_incr_syncpts(struct tegra_camera_dev *pcdev)
 {
-	nvhost_syncpt_cpu_incr_ext(pcdev->ndev,
+	nvhost_syncpt_cpu_incr_ext(pcdev->vi_pdev,
 				   TEGRA_VI_SYNCPT_CSI);
 
-	nvhost_syncpt_cpu_incr_ext(pcdev->ndev,
+	nvhost_syncpt_cpu_incr_ext(pcdev->vi_pdev,
 				   TEGRA_VI_SYNCPT_VI);
 }
 
@@ -729,13 +752,13 @@ static int tegra_camera_capture_start(struct tegra_camera_dev *pcdev,
 	 * wait on VIP VSYNC syncpt.
 	 */
 	if (tegra_camera_port_is_csi(port))
-		err = nvhost_syncpt_wait_timeout_ext(pcdev->ndev,
+		err = nvhost_syncpt_wait_timeout_ext(pcdev->vi_pdev,
 			TEGRA_VI_SYNCPT_CSI,
 			pcdev->syncpt_csi,
 			TEGRA_SYNCPT_CSI_WAIT_TIMEOUT,
 			NULL);
 	else
-		err = nvhost_syncpt_wait_timeout_ext(pcdev->ndev,
+		err = nvhost_syncpt_wait_timeout_ext(pcdev->vi_pdev,
 			TEGRA_VI_SYNCPT_VI,
 			pcdev->syncpt_csi,
 			TEGRA_SYNCPT_VI_WAIT_TIMEOUT,
@@ -749,8 +772,8 @@ static int tegra_camera_capture_start(struct tegra_camera_dev *pcdev,
 		u32 cilstatus;
 		u32 rostatus;
 
-		dev_err(&pcdev->ndev->dev, "Timeout on CSI syncpt\n");
-		dev_err(&pcdev->ndev->dev, "buffer_addr = 0x%08x\n",
+		dev_err(&pcdev->pdev->dev, "Timeout on CSI syncpt\n");
+		dev_err(&pcdev->pdev->dev, "buffer_addr = 0x%08x\n",
 			buf->buffer_addr);
 
 		ppstatus = TC_VI_REG_RD(pcdev,
@@ -760,7 +783,7 @@ static int tegra_camera_capture_start(struct tegra_camera_dev *pcdev,
 		rostatus = TC_VI_REG_RD(pcdev,
 			TEGRA_CSI_CSI_READONLY_STATUS);
 
-		dev_err(&pcdev->ndev->dev,
+		dev_err(&pcdev->pdev->dev,
 			"PPSTATUS = 0x%08x, "
 			"CILSTATUS = 0x%08x, "
 			"ROSTATUS = 0x%08x\n",
@@ -768,14 +791,14 @@ static int tegra_camera_capture_start(struct tegra_camera_dev *pcdev,
 	} else {
 		u32 vip_input_status;
 
-		dev_err(&pcdev->ndev->dev, "Timeout on VI syncpt\n");
-		dev_err(&pcdev->ndev->dev, "buffer_addr = 0x%08x\n",
+		dev_err(&pcdev->pdev->dev, "Timeout on VI syncpt\n");
+		dev_err(&pcdev->pdev->dev, "buffer_addr = 0x%08x\n",
 			buf->buffer_addr);
 
 		vip_input_status = TC_VI_REG_RD(pcdev,
 			TEGRA_VI_VIP_INPUT_STATUS);
 
-		dev_err(&pcdev->ndev->dev,
+		dev_err(&pcdev->pdev->dev,
 			"VIP_INPUT_STATUS = 0x%08x\n",
 			vip_input_status);
 	}
@@ -801,7 +824,7 @@ static int tegra_camera_capture_stop(struct tegra_camera_dev *pcdev)
 			     0x00000005);
 
 	if (tegra_camera_port_is_csi(port))
-		err = nvhost_syncpt_wait_timeout_ext(pcdev->ndev,
+		err = nvhost_syncpt_wait_timeout_ext(pcdev->vi_pdev,
 			TEGRA_VI_SYNCPT_VI,
 			pcdev->syncpt_vi,
 			TEGRA_SYNCPT_VI_WAIT_TIMEOUT,
@@ -814,17 +837,17 @@ static int tegra_camera_capture_stop(struct tegra_camera_dev *pcdev)
 		u32 ppstatus;
 		u32 cilstatus;
 
-		dev_err(&pcdev->ndev->dev, "Timeout on VI syncpt\n");
+		dev_err(&pcdev->pdev->dev, "Timeout on VI syncpt\n");
 		buffer_addr = TC_VI_REG_RD(pcdev,
 					   TEGRA_VI_VB0_BASE_ADDRESS_FIRST);
-		dev_err(&pcdev->ndev->dev, "buffer_addr = 0x%08x\n",
+		dev_err(&pcdev->pdev->dev, "buffer_addr = 0x%08x\n",
 			buffer_addr);
 
 		ppstatus = TC_VI_REG_RD(pcdev,
 					TEGRA_CSI_CSI_PIXEL_PARSER_STATUS);
 		cilstatus = TC_VI_REG_RD(pcdev,
 					 TEGRA_CSI_CSI_CIL_STATUS);
-		dev_err(&pcdev->ndev->dev,
+		dev_err(&pcdev->pdev->dev,
 			"PPSTATUS = 0x%08x, CILSTATUS = 0x%08x\n",
 			ppstatus, cilstatus);
 	}
@@ -936,14 +959,29 @@ static void tegra_camera_work(struct work_struct *work)
 
 static void tegra_camera_activate(struct tegra_camera_dev *pcdev)
 {
-	nvhost_module_busy_ext(pcdev->ndev);
+	/*
+	 * sk1wg: power the VI first, as NVIDIA's tegra_camera_power_on()
+	 * does: the CSI pads' supply, then the VE partition the VI lives in
+	 * (tegra_camera powergates it at boot), with DIS up because
+	 * powergating DIS takes VE down. Touching VI registers with VE off
+	 * hangs the bus and the watchdog resets the tablet. DIS is
+	 * reference counted, so the display is not affected.
+	 */
+	if (pcdev->reg_csi && regulator_enable(pcdev->reg_csi))
+		dev_err(&pcdev->pdev->dev, "csi regulator enable failed\n");
+	if (tegra_unpowergate_partition(TEGRA_POWERGATE_DISA))
+		dev_err(&pcdev->pdev->dev, "DIS unpowergate failed\n");
+	if (tegra_unpowergate_partition(TEGRA_POWERGATE_VENC))
+		dev_err(&pcdev->pdev->dev, "VE unpowergate failed\n");
+
+	nvhost_module_busy_ext(pcdev->vi_pdev);
 
 	/* Turn on relevant clocks. */
-	clk_enable(pcdev->clk_vi);
-	clk_enable(pcdev->clk_vi_sensor);
-	clk_enable(pcdev->clk_csi);
-	clk_enable(pcdev->clk_isp);
-	clk_enable(pcdev->clk_csus);
+	clk_prepare_enable(pcdev->clk_vi);
+	clk_prepare_enable(pcdev->clk_vi_sensor);
+	clk_prepare_enable(pcdev->clk_csi);
+	clk_prepare_enable(pcdev->clk_isp);
+	clk_prepare_enable(pcdev->clk_csus);
 
 	/* Save current syncpt values. */
 	tegra_camera_save_syncpts(pcdev);
@@ -963,13 +1001,19 @@ static void tegra_camera_deactivate(struct tegra_camera_dev *pcdev)
 	mutex_unlock(&pcdev->work_mutex);
 
 	/* Turn off relevant clocks. */
-	clk_disable(pcdev->clk_vi);
-	clk_disable(pcdev->clk_vi_sensor);
-	clk_disable(pcdev->clk_csi);
-	clk_disable(pcdev->clk_isp);
-	clk_disable(pcdev->clk_csus);
+	clk_disable_unprepare(pcdev->clk_vi);
+	clk_disable_unprepare(pcdev->clk_vi_sensor);
+	clk_disable_unprepare(pcdev->clk_csi);
+	clk_disable_unprepare(pcdev->clk_isp);
+	clk_disable_unprepare(pcdev->clk_csus);
 
-	nvhost_module_idle_ext(pcdev->ndev);
+	nvhost_module_idle_ext(pcdev->vi_pdev);
+
+	/* the reverse of tegra_camera_activate() */
+	tegra_powergate_partition(TEGRA_POWERGATE_VENC);
+	tegra_powergate_partition(TEGRA_POWERGATE_DISA);
+	if (pcdev->reg_csi)
+		regulator_disable(pcdev->reg_csi);
 }
 
 static void tegra_camera_init_buffer(struct tegra_camera_dev *pcdev,
@@ -1262,17 +1306,39 @@ static int tegra_camera_add_device(struct soc_camera_device *icd)
 {
 	struct soc_camera_host *ici = to_soc_camera_host(icd->parent);
 	struct tegra_camera_dev *pcdev = ici->priv;
+	struct soc_camera_link *icl = to_soc_camera_link(icd);
 	int err;
 
 	if (pcdev->icd)
 		return -EBUSY;
 
+	/* sk1wg: port, lanes and power hooks come with each sensor */
+	if (!icl || !icl->priv) {
+		dev_err(icd->parent, "camera %d has no tegra platform data\n",
+			icd->devnum);
+		return -EINVAL;
+	}
+	pcdev->pdata = icl->priv;
+	if (force_port)
+		pcdev->pdata->port = force_port;
+	if (force_lanes)
+		pcdev->pdata->lanes = force_lanes;
+	dev_info(icd->parent, "camera %d on port %d, %d lane(s)\n",
+		 icd->devnum, pcdev->pdata->port, pcdev->pdata->lanes);
+	if (!tegra_camera_port_is_valid(pcdev->pdata->port)) {
+		dev_err(icd->parent, "invalid camera port %d\n",
+			pcdev->pdata->port);
+		return -EINVAL;
+	}
+
 	pm_runtime_get_sync(ici->v4l2_dev.dev);
 
 	if (pcdev->pdata->enable_camera) {
-		err = pcdev->pdata->enable_camera(pcdev->ndev);
-		if (IS_ERR_VALUE(err))
+		err = pcdev->pdata->enable_camera(pcdev->pdev);
+		if (IS_ERR_VALUE(err)) {
+			pm_runtime_put_sync(ici->v4l2_dev.dev);
 			return err;
+		}
 	}
 
 	tegra_camera_activate(pcdev);
@@ -1298,7 +1364,7 @@ static void tegra_camera_remove_device(struct soc_camera_device *icd)
 	pcdev->icd = NULL;
 
 	if (pcdev->pdata->disable_camera)
-		pcdev->pdata->disable_camera(pcdev->ndev);
+		pcdev->pdata->disable_camera(pcdev->pdev);
 
 	pm_runtime_put_sync(ici->v4l2_dev.dev);
 
@@ -1520,26 +1586,43 @@ static struct soc_camera_host_ops tegra_soc_camera_host_ops = {
 	.querycap	= tegra_camera_querycap,
 };
 
-static int __devinit tegra_camera_probe(struct nvhost_device *ndev,
-					struct nvhost_device_id *id_table)
+static int tegra_camera_match_vi(struct device *dev, void *data)
+{
+	return !strcmp(dev_name(dev), "vi");
+}
+
+static int __devinit tegra_camera_probe(struct platform_device *pdev)
 {
 	struct tegra_camera_dev *pcdev;
+	struct nvhost_device_data *vi_data;
+	struct device *vi_dev;
 	int err = 0;
+
+	/* the nvhost VI client has mapped the registers and owns the syncpts */
+	vi_dev = bus_find_device(&platform_bus_type, NULL, NULL,
+				 tegra_camera_match_vi);
+	if (!vi_dev)
+		return -EPROBE_DEFER;
+	vi_data = dev_get_drvdata(vi_dev);
+	if (!vi_data || !vi_data->aperture) {
+		put_device(vi_dev);
+		return -EPROBE_DEFER;
+	}
 
 	pcdev = kzalloc(sizeof(struct tegra_camera_dev), GFP_KERNEL);
 	if (!pcdev) {
-		dev_err(&ndev->dev, "Could not allocate pcdev\n");
-		err = -ENOMEM;
-		goto exit;
+		dev_err(&pdev->dev, "Could not allocate pcdev\n");
+		put_device(vi_dev);
+		return -ENOMEM;
 	}
 
-	pcdev->pdata			= ndev->dev.platform_data;
-	pcdev->ndev			= ndev;
+	pcdev->pdev			= pdev;
+	pcdev->vi_pdev			= to_platform_device(vi_dev);
 
 	pcdev->ici.priv		= pcdev;
-	pcdev->ici.v4l2_dev.dev	= &ndev->dev;
-	pcdev->ici.nr		= ndev->id;
-	pcdev->ici.drv_name	= dev_name(&ndev->dev);
+	pcdev->ici.v4l2_dev.dev	= &pdev->dev;
+	pcdev->ici.nr		= pdev->id < 0 ? 0 : pdev->id;
+	pcdev->ici.drv_name	= dev_name(&pdev->dev);
 	pcdev->ici.ops		= &tegra_soc_camera_host_ops;
 
 	INIT_LIST_HEAD(&pcdev->capture);
@@ -1547,60 +1630,51 @@ static int __devinit tegra_camera_probe(struct nvhost_device *ndev,
 	spin_lock_init(&pcdev->videobuf_queue_lock);
 	mutex_init(&pcdev->work_mutex);
 
-	nvhost_set_drvdata(ndev, pcdev);
-
-	if (!tegra_camera_port_is_valid(pcdev->pdata->port)) {
-		dev_err(&ndev->dev, "Invalid camera port %d in platform data\n",
-			pcdev->pdata->port);
-		goto exit_free_pcdev;
-	}
-
-	pcdev->clk_vi = clk_get_sys("tegra_camera", "vi");
+	err = -ENODEV;
+	pcdev->clk_vi = clk_get_sys("vi", "vi");
 	if (IS_ERR_OR_NULL(pcdev->clk_vi)) {
-		dev_err(&ndev->dev, "Failed to get vi clock.\n");
+		dev_err(&pdev->dev, "Failed to get vi clock.\n");
 		goto exit_free_pcdev;
 	}
 
-	pcdev->clk_vi_sensor = clk_get_sys("tegra_camera", "vi_sensor");
+	pcdev->clk_vi_sensor = clk_get_sys("vi", "vi_sensor");
 	if (IS_ERR_OR_NULL(pcdev->clk_vi_sensor)) {
-		dev_err(&ndev->dev, "Failed to get vi_sensor clock.\n");
+		dev_err(&pdev->dev, "Failed to get vi_sensor clock.\n");
 		goto exit_put_clk_vi;
 	}
 
-	pcdev->clk_csi = clk_get_sys("tegra_camera", "csi");
+	pcdev->clk_csi = clk_get_sys("vi", "csi");
 	if (IS_ERR_OR_NULL(pcdev->clk_csi)) {
-		dev_err(&ndev->dev, "Failed to get csi clock.\n");
+		dev_err(&pdev->dev, "Failed to get csi clock.\n");
 		goto exit_put_clk_vi_sensor;
 	}
 
-	pcdev->clk_isp = clk_get_sys("tegra_camera", "isp");
+	pcdev->clk_isp = clk_get_sys("vi", "isp");
 	if (IS_ERR_OR_NULL(pcdev->clk_isp)) {
-		dev_err(&ndev->dev, "Failed to get isp clock.\n");
+		dev_err(&pdev->dev, "Failed to get isp clock.\n");
 		goto exit_put_clk_csi;
 	}
 
-	pcdev->clk_csus = clk_get_sys("tegra_camera", "csus");
+	pcdev->clk_csus = clk_get_sys("vi", "csus");
 	if (IS_ERR_OR_NULL(pcdev->clk_csus)) {
-		dev_err(&ndev->dev, "Failed to get csus clock.\n");
+		dev_err(&pdev->dev, "Failed to get csus clock.\n");
 		goto exit_put_clk_isp;
 	}
 
 	clk_set_rate(pcdev->clk_vi, 150000000);
 	clk_set_rate(pcdev->clk_vi_sensor, 24000000);
 
-	err = nvhost_client_device_get_resources(ndev);
-	if (err)
-		goto exit_put_clk_csus;
+	pcdev->vi_base = vi_data->aperture;
 
-	nvhost_client_device_init(ndev);
+	pcdev->reg_csi = regulator_get(vi_dev, "avdd_dsi_csi");
+	if (IS_ERR(pcdev->reg_csi)) {
+		dev_info(&pdev->dev, "no avdd_dsi_csi regulator\n");
+		pcdev->reg_csi = NULL;
+	}
 
-	pcdev->vi_base = ndev->aperture;
+	pm_runtime_enable(&pdev->dev);
 
-	pm_suspend_ignore_children(&ndev->dev, true);
-	pm_runtime_enable(&ndev->dev);
-	pm_runtime_resume(&ndev->dev);
-
-	pcdev->alloc_ctx = vb2_dma_nvmap_init_ctx(NULL);
+	pcdev->alloc_ctx = vb2_dma_nvmap_init_ctx(&pdev->dev);
 	if (IS_ERR(pcdev->alloc_ctx)) {
 		err = PTR_ERR(pcdev->alloc_ctx);
 		goto exit_put_resources;
@@ -1610,16 +1684,16 @@ static int __devinit tegra_camera_probe(struct nvhost_device *ndev,
 	if (IS_ERR_VALUE(err))
 		goto exit_cleanup_alloc_ctx;
 
-	dev_notice(&ndev->dev, "Tegra camera driver loaded.\n");
+	dev_notice(&pdev->dev, "Tegra camera driver loaded.\n");
 
 	return err;
 
 exit_cleanup_alloc_ctx:
-	vb2_dma_nvmap_cleanup_ctx(&ndev->dev);
+	vb2_dma_nvmap_cleanup_ctx(pcdev->alloc_ctx);
 exit_put_resources:
-	pm_runtime_disable(&ndev->dev);
-	nvhost_client_device_put_resources(ndev);
-exit_put_clk_csus:
+	pm_runtime_disable(&pdev->dev);
+	if (pcdev->reg_csi)
+		regulator_put(pcdev->reg_csi);
 	clk_put(pcdev->clk_csus);
 exit_put_clk_isp:
 	clk_put(pcdev->clk_isp);
@@ -1631,122 +1705,68 @@ exit_put_clk_vi:
 	clk_put(pcdev->clk_vi);
 exit_free_pcdev:
 	kfree(pcdev);
-exit:
+	put_device(vi_dev);
 	return err;
 }
 
-static int __devexit tegra_camera_remove(struct nvhost_device *ndev)
+static int __devexit tegra_camera_remove(struct platform_device *pdev)
 {
-	struct soc_camera_host *ici = to_soc_camera_host(&ndev->dev);
+	struct soc_camera_host *ici = to_soc_camera_host(&pdev->dev);
 	struct tegra_camera_dev *pcdev = container_of(ici,
 					struct tegra_camera_dev, ici);
-	struct resource *res;
-
-	res = nvhost_get_resource_byname(ndev, IORESOURCE_MEM, "regs");
-	if (!res)
-		return -EBUSY;
 
 	soc_camera_host_unregister(ici);
 
-	vb2_dma_nvmap_cleanup_ctx(&ndev->dev);
+	vb2_dma_nvmap_cleanup_ctx(pcdev->alloc_ctx);
 
-	pm_runtime_disable(&ndev->dev);
+	pm_runtime_disable(&pdev->dev);
 
-	nvhost_client_device_put_resources(ndev);
-
+	if (pcdev->reg_csi)
+		regulator_put(pcdev->reg_csi);
 	clk_put(pcdev->clk_csus);
 	clk_put(pcdev->clk_isp);
 	clk_put(pcdev->clk_csi);
 	clk_put(pcdev->clk_vi_sensor);
 	clk_put(pcdev->clk_vi);
 
+	put_device(&pcdev->vi_pdev->dev);
 	kfree(pcdev);
 
-	dev_notice(&ndev->dev, "Tegra camera host driver unloaded\n");
+	dev_notice(&pdev->dev, "Tegra camera host driver unloaded\n");
 
 	return 0;
 }
 
-#ifdef CONFIG_PM_FISH
-static int tegra_camera_suspend(struct nvhost_device *ndev, pm_message_t state)
-{
-	struct soc_camera_host *ici = to_soc_camera_host(&ndev->dev);
-	struct tegra_camera_dev *pcdev = container_of(ici,
-					struct tegra_camera_dev, ici);
-
-	mutex_lock(&pcdev->work_mutex);
-
-	/* We only need to do something if a camera sensor is attached. */
-	if (pcdev->icd) {
-		/* Suspend the camera sensor. */
-		WARN_ON(!pcdev->icd->ops->suspend);
-		pcdev->icd->ops->suspend(pcdev->icd, state);
-
-		/* Power off the camera subsystem. */
-		pcdev->pdata->disable_camera(pcdev->ndev);
-
-		nvhost_module_idle_ext(nvhost_get_parent(ndev));
-	}
-
-	return 0;
-}
-
-static int tegra_camera_resume(struct nvhost_device *ndev)
-{
-	struct soc_camera_host *ici = to_soc_camera_host(&ndev->dev);
-	struct tegra_camera_dev *pcdev = container_of(ici,
-					struct tegra_camera_dev, ici);
-
-	/* We only need to do something if a camera sensor is attached. */
-	if (pcdev->icd) {
-		nvhost_module_busy_ext(nvhost_get_parent(ndev));
-
-		/* Power on the camera subsystem. */
-		pcdev->pdata->enable_camera(pcdev->ndev);
-
-		/* Resume the camera host. */
-		tegra_camera_save_syncpts(pcdev);
-		tegra_camera_capture_setup(pcdev);
-
-		/* Resume the camera sensor. */
-		WARN_ON(!pcdev->icd->ops->resume);
-		pcdev->icd->ops->resume(pcdev->icd);
-	}
-
-	mutex_unlock(&pcdev->work_mutex);
-
-	return 0;
-}
-#endif
-
-static struct nvhost_driver tegra_camera_driver = {
+/*
+ * sk1wg: the host is the board's "tegra-camera" platform device, not the
+ * nvhost "vi" client (see struct tegra_camera_dev). No suspend/resume:
+ * the old ones were never built (CONFIG_PM_FISH), and soc_camera powers
+ * the sensor down when the video device is closed.
+ */
+static struct platform_driver tegra_camera_driver = {
 	.driver	= {
 		.name	= TEGRA_CAM_DRV_NAME,
 		.owner	= THIS_MODULE,
 	},
 	.probe		= tegra_camera_probe,
 	.remove		= __devexit_p(tegra_camera_remove),
-#ifdef CONFIG_PM_FISH
-	.suspend	= tegra_camera_suspend,
-	.resume		= tegra_camera_resume,
-#endif
 };
 
-
+/* after the nvhost "vi" driver (late_initcall) */
 static int __init tegra_camera_init(void)
 {
-	return nvhost_driver_register(&tegra_camera_driver);
+	return platform_driver_register(&tegra_camera_driver);
 }
 
 static void __exit tegra_camera_exit(void)
 {
-	nvhost_driver_unregister(&tegra_camera_driver);
+	platform_driver_unregister(&tegra_camera_driver);
 }
 
-module_init(tegra_camera_init);
+late_initcall_sync(tegra_camera_init);
 module_exit(tegra_camera_exit);
 
 MODULE_DESCRIPTION("TEGRA SoC Camera Host driver");
 MODULE_AUTHOR("Andrew Chew <achew@nvidia.com>");
 MODULE_LICENSE("GPL v2");
-MODULE_ALIAS("nvhost:" TEGRA_CAM_DRV_NAME);
+MODULE_ALIAS("platform:" TEGRA_CAM_DRV_NAME);

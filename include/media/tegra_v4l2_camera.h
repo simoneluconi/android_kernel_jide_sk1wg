@@ -19,7 +19,7 @@
 
 #include <linux/regulator/consumer.h>
 #include <linux/i2c.h>
-#include <linux/nvhost.h>
+#include <linux/platform_device.h>
 
 enum tegra_camera_port {
 	TEGRA_CAMERA_PORT_CSI_A = 1,
@@ -27,9 +27,14 @@ enum tegra_camera_port {
 	TEGRA_CAMERA_PORT_VIP,
 };
 
+/*
+ * One per sensor, as its soc_camera_link's priv (sk1wg: the host used to
+ * take a single one as the nvhost device's platform data). The hooks get
+ * the "tegra-camera" host device.
+ */
 struct tegra_camera_platform_data {
-	int			(*enable_camera)(struct nvhost_device *ndev);
-	void			(*disable_camera)(struct nvhost_device *ndev);
+	int			(*enable_camera)(struct platform_device *pdev);
+	void			(*disable_camera)(struct platform_device *pdev);
 	bool			flip_h;
 	bool			flip_v;
 	enum tegra_camera_port	port;

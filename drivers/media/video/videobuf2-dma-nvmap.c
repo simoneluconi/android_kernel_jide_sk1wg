@@ -53,8 +53,15 @@ static void *vb2_dma_nvmap_alloc(void *alloc_ctx, unsigned long size)
 		goto exit;
 	}
 
+	/*
+	 * sk1wg: T114's nvmap refuses SYSMEM handles; IOVMM, as NVIDIA's
+	 * own camera stack used with the VI there. Write-combined, so the
+	 * CPU reads what the VI wrote without cache maintenance (none of
+	 * this allocator's paths does any).
+	 */
 	buf->nvmap_ref = nvmap_alloc(conf->nvmap_client, size, 32,
-				     NVMAP_HANDLE_CACHEABLE, NVMAP_HEAP_SYSMEM);
+				     NVMAP_HANDLE_WRITE_COMBINE,
+				     NVMAP_HEAP_IOVMM);
 	if (IS_ERR(buf->nvmap_ref)) {
 		dev_err(conf->dev, "nvmap_alloc failed\n");
 		ret = -ENOMEM;
